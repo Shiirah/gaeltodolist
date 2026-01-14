@@ -37,7 +37,7 @@
       ansible.builtin.git:
         repo: "https://github.com/gaeldb/to-do-list.git"
         dest: "{{ app_dir }}"
-        version: "main"
+        version: "{{ app_version | default('main') }}"
         force: true
       become: false
 
