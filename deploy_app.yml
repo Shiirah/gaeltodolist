@@ -1,0 +1,142 @@
+---
+- name: Deploiement exo 13
+  hosts: my_infra
+  become: true
+
+  vars:
+    app_user: admin
+    app_home: "/home/{{ app_user }}"
+    app_dir: "{{ app_home }}/to-do-list"
+    venv_dir: "{{ app_dir }}/venv"
+    venv_python: "{{ venv_dir }}/bin/python"
+    gunicorn_bin: "{{ venv_dir }}/bin/gunicorn"
+    service_name: todolist
+    bind_addr: "0.0.0.0:8000"
+    wsgi_module: "todo.wsgi:application"
+
+  tasks:
+    - name: Installer les prerequis systeme
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - git
+          - python3
+          - python3-venv
+          - python3-pip
+        state: present
+
+    - name: Creer le repertoire applicatif
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Telecharger l'application depuis Github
+      ansible.builtin.git:
+        repo: "https://github.com/gaeldb/to-do-list.git"
+        dest: "{{ app_dir }}"
+        version: "main"
+        force: true
+      become: false
+
+    - name: Fix ownership apres git
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: true
+
+    - name: Supprimer la venv existante
+      ansible.builtin.file:
+        path: "{{ venv_dir }}"
+        state: absent
+
+    - name: Creer la venv (en user admin)
+      ansible.builtin.command: "python3 -m venv {{ venv_dir }}"
+      args:
+        creates: "{{ venv_python }}"
+      become: false
+
+    - name: Installer Django + Gunicorn dans la venv (en user admin)
+      ansible.builtin.pip:
+        name:
+          - django
+          - gunicorn
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_command: "python3 -m venv"
+      become: false
+
+    - name: Autoriser l'IP de la VM dans ALLOWED_HOSTS
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/todo/settings.py"
+        regexp: '^ALLOWED_HOSTS\s*='
+        line: 'ALLOWED_HOSTS = ["{{ ansible_host }}", "localhost", "127.0.0.1"]'
+      become: false
+
+    - name: Definir DEBUG selon l'hote (dev/prod)
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/todo/settings.py"
+        regexp: '^DEBUG\s*='
+        line: "DEBUG = {{ django_debug | ternary('True','False') }}"
+      become: false
+      when: django_debug is defined
+
+    - name: Migrations Django (SQLite)
+      ansible.builtin.command: "{{ venv_python }} manage.py migrate"
+      args:
+        chdir: "{{ app_dir }}"
+      become: false
+
+    - name: Creer le service systemd Gunicorn
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Todolist Django via Gunicorn
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          ExecStart={{ gunicorn_bin }} --workers 2 --bind {{ bind_addr }} {{ wsgi_module }}
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Demarrer et activer le service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: restarted
+        enabled: true
+
+    - name: Attendre que le port 8000 soit ouvert
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 8000
+        timeout: 30
+      delegate_to: localhost
+      become: false
+
+    - name: Verifier que l'URL repond en HTTP 200
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:8000/"
+        method: GET
+        status_code: 200
+        return_content: false
+      register: http_check
+      retries: 10
+      delay: 2
+      until: http_check.status == 200
+      delegate_to: localhost
+      become: false
